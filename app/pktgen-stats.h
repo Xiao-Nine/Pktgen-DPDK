@@ -27,9 +27,12 @@ extern "C" {
 
 /** Per-queue packet counters. */
 typedef struct qstats_s {
-    uint64_t q_ipackets; /**< Number of input packets */
-    uint64_t q_opackets; /**< Number of output packets */
-    uint64_t q_errors;   /**< Number of error packets */
+    uint64_t q_ipackets;  /**< Number of input packets */
+    uint64_t q_opackets;  /**< Number of output packets */
+    uint64_t q_obytes;    /**< Number of output bytes (L2 frame length) */
+    uint64_t q_errors;    /**< Number of error packets */
+    uint64_t q_ring_full; /**< Packets deferred because the TX ring was full */
+    uint64_t q_mbuf_fail; /**< Passes where no mbuf could be allocated */
 } qstats_t;
 
 /** Packet size histogram counters. */
@@ -55,7 +58,13 @@ typedef struct xstats_s {
     int cnt;                          /**< Number of extended stats entries */
 } xstats_t;
 
-/** Aggregate per-port statistics (current, previous, rate, and base). */
+/**
+ * Aggregate per-port statistics.
+ *
+ * The rate member is normalized to a one second window, so it can be used
+ * directly as packets/second and bits/second regardless of how often
+ * pktgen_process_stats() actually runs.
+ */
 typedef struct port_stats_s {
     struct rte_eth_stats curr; /**< current port statistics */
     struct rte_eth_stats prev; /**< previous port statistics */
@@ -63,11 +72,16 @@ typedef struct port_stats_s {
     struct rte_eth_stats base; /**< base port statistics for normalization */
     xstats_t xstats;           /**< Extended statistics */
 
+    uint64_t last_tsc;    /**< Timestamp of the previous rate sample */
+    uint64_t elapsed;     /**< Ticks elapsed since the previous rate sample */
+    uint8_t have_sample;  /**< Non-zero once the first rate sample was taken */
+
     size_stats_t sizes; /**< Packet size counters */
 
     qstats_t qstats[MAX_QUEUES_PER_PORT];      /**< Hot-path: written only by worker lcores */
     qstats_t snap_qstats[MAX_QUEUES_PER_PORT]; /**< Snapshot: written only by timer thread */
     qstats_t prev_qstats[MAX_QUEUES_PER_PORT]; /**< Previous snapshot for rate calculation */
+    qstats_t qrate[MAX_QUEUES_PER_PORT];       /**< Per queue rates, normalized per second */
 } port_stats_t;
 
 struct port_info_s;

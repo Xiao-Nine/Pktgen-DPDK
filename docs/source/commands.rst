@@ -218,6 +218,8 @@ List of the ``set`` commands::
     set <portlist> count <value>       - number of packets to transmit
     set <portlist> size <value>        - size of the packet to transmit
     set <portlist> rate <percent>      - Packet rate in percentage
+    set <portlist> pps <packets/sec>   - Absolute packet rate for the whole port
+    set <portlist> bps <bits/sec>      - Absolute wire bandwidth, L1 bits/sec
     set <portlist> txburst <value>     - number of packets in a Tx burst
     set <portlist> rxburst <value>     - number of packets in a Rx burst
     set <portlist> tx_cycles <value>   - DEBUG to set the number of cycles per TX burst

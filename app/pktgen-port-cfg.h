@@ -152,10 +152,47 @@ typedef struct {
     MARKER end_stats;                 /**< End marker for stats region (used to clear stats) */
 } latency_t;
 
+/** How the transmit rate target is expressed. */
+typedef enum {
+    RATE_PCT = 0, /**< Percentage of the link bandwidth (default) */
+    RATE_PPS,     /**< Absolute packets per second, whole port */
+    RATE_BPS,     /**< Absolute L1 bits per second, whole port */
+    RATE_CYCLES,  /**< Debug: raw cycles between bursts */
+} rate_mode_t;
+
+/**
+ * Token bucket pacing state, one instance per TX queue.
+ *
+ * The bucket is refilled from the elapsed time since the previous visit, so a
+ * busy iteration never loses the budget it was entitled to (unlike the old
+ * "reset the phase on lag" approach). The budget is measured in bits when
+ * pacing on bandwidth, or in packets when pacing on packet rate.
+ */
+typedef struct pace_s {
+    uint64_t credit;     /**< Budget available right now */
+    uint64_t cap;        /**< Upper bound of the accumulated budget */
+    uint64_t frac;       /**< Fractional refill remainder */
+    uint64_t last_tsc;   /**< Timestamp of the previous refill (0 = not armed) */
+    uint64_t rate_units; /**< Budget added per second for this queue (0 = unlimited) */
+    uint64_t min_cost;   /**< Cost of the cheapest possible packet */
+    uint16_t in_bits;    /**< Non-zero when the budget is measured in bits */
+} pace_t;
+
 /** Per-queue packet buffer arrays for RX and TX. */
 typedef struct per_queue_s {
     struct rte_mbuf **rx_pkts; /**< Array of pointers to packet buffers for RX */
     struct rte_mbuf **tx_pkts; /**< Array of pointers to packet buffers for TX */
+
+    /**
+     * Packets that were fetched but could not be handed to the NIC yet, either
+     * because the pacing budget was exhausted or because the TX ring was full.
+     * Keeping them here (instead of freeing them back to the mempool) preserves
+     * the replay order of a PCAP file across loop iterations.
+     */
+    struct rte_mbuf *carry[MAX_PKT_TX_BURST];
+    uint16_t carry_nb; /**< Number of valid entries in carry[] */
+
+    pace_t pace; /**< Rate limiter state for this queue */
 } per_queue_t;
 
 /** Central per-port state for Pktgen. */
@@ -176,6 +213,14 @@ typedef struct port_info_s {
     uint16_t max_mtu;                 /**< Maximum MTU size */
     uint64_t tx_pps;                  /**< Transmit packets per seconds */
     double tx_rate;                   /**< Percentage rate for tx packets with fractions */
+
+    /* Rate control ------------------------------------------------------- */
+    rate_mode_t rate_mode; /**< How the rate target below is interpreted */
+    uint64_t rate_pps_cfg; /**< Configured absolute packet rate (RATE_PPS) */
+    uint64_t rate_bps_cfg; /**< Configured absolute bandwidth (RATE_BPS) */
+    uint64_t rate_bps;     /**< Resolved L1 bits/second target for the port */
+    uint64_t tx_wire_bits; /**< Average wire bits per packet used for pacing */
+
     uint16_t seqIdx;                  /**< Current Packet sequence index 0 to NUM_SEQ_PKTS */
     uint16_t seqCnt;                  /**< Current packet sequence max count */
     uint16_t prime_cnt;               /**< Set the number of packets to send in a prime command */

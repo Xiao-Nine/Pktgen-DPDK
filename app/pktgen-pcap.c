@@ -84,7 +84,9 @@ pcap_get_info(pcap_info_t *pcap)
 
     pcap->max_pkt_size  = 0;
     pcap->avg_pkt_size  = 0;
-    uint64_t total_size = 0;
+    pcap->total_bytes   = 0;
+    pcap->pkt_count     = 0;
+
     /* count the number of packets and get the largest size packet */
     for (;;) {
         if (fread(&hdr, 1, sizeof(pcap_record_hdr_t), pcap->fp) != sizeof(hdr))
@@ -100,41 +102,68 @@ pcap_get_info(pcap_info_t *pcap)
         if (hdr.incl_len > pcap->max_pkt_size)
             pcap->max_pkt_size = hdr.incl_len;
 
-        total_size += hdr.incl_len;
+        pcap->total_bytes += hdr.incl_len;
     }
     printf("PCAP: Max Packet Size: %d\n", pcap->max_pkt_size);
 
-    pcap->avg_pkt_size = total_size / pcap->pkt_count;
+    if (pcap->pkt_count)
+        pcap->avg_pkt_size = (uint32_t)(pcap->total_bytes / pcap->pkt_count);
 
     printf("PCAP: Avg Packet Size: %d\n", pcap->avg_pkt_size);
 
     pcap_rewind(pcap);
 }
 
-static __inline__ void
-mbuf_iterate_cb(struct rte_mempool *mp, void *opaque, void *obj, unsigned obj_idx __rte_unused)
+/**
+ * Load the PCAP records into a set of per-queue mempools.
+ *
+ * Records are handed to the queues in a round-robin fashion, so queue q owns
+ * the records q, q+nq, q+2*nq, ... Each pool is filled in file order, therefore
+ * every queue replays its own share of the file strictly in capture order,
+ * which the previous single shared mempool could not guarantee.
+ *
+ * @param pcap  PCAP state (already parsed by pcap_get_info()).
+ * @param mp    Array of @p nq mempools, one per TX queue.
+ * @param nq    Number of queues (mempools).
+ * @param reps  How many times the file is loaded into each pool. A value
+ *              larger than one is used so that a small capture file still
+ *              provides enough in-flight buffers for the TX ring.
+ */
+static void
+pcap_load_file(pcap_info_t *pcap, struct rte_mempool *const *mp, uint32_t nq, uint32_t reps)
 {
-    pcap_info_t *pcap     = (pcap_info_t *)opaque;
-    struct rte_mbuf *m    = (struct rte_mbuf *)obj;
-    pcap_record_hdr_t hdr = {0};
+    pcap_record_hdr_t hdr;
+    struct rte_mbuf *m;
+    uint32_t j, rep;
 
-    if (fread(&hdr, 1, sizeof(pcap_record_hdr_t), pcap->fp) != sizeof(hdr)) {
+    for (rep = 0; rep < reps; rep++) {
         pcap_rewind(pcap);
-        if (fread(&hdr, 1, sizeof(pcap_record_hdr_t), pcap->fp) != sizeof(hdr))
-            rte_exit(EXIT_FAILURE, "%s: failed to read pcap header\n", __func__);
+
+        for (j = 0; j < pcap->pkt_count; j++) {
+            struct rte_mempool *pool = mp[j % nq];
+
+            if (fread(&hdr, 1, sizeof(pcap_record_hdr_t), pcap->fp) != sizeof(hdr))
+                rte_exit(EXIT_FAILURE, "%s: failed to read pcap header\n", __func__);
+
+            pcap_convert(pcap, &hdr);
+
+            m = rte_pktmbuf_alloc(pool);
+            if (unlikely(m == NULL))
+                rte_exit(EXIT_FAILURE, "%s: pool %s exhausted at record %u/%u\n", __func__,
+                         pool->name, j, pcap->pkt_count);
+
+            if (fread(rte_pktmbuf_mtod(m, char *), 1, hdr.incl_len, pcap->fp) != hdr.incl_len)
+                rte_exit(EXIT_FAILURE, "%s: failed to read packet data from PCAP file\n",
+                         __func__);
+
+            m->data_len = hdr.incl_len;
+            m->pkt_len  = hdr.incl_len;
+            m->port     = 0;
+            m->ol_flags = 0;
+            m->l2_len   = 0;
+            m->l3_len   = 0;
+        }
     }
-
-    pcap_convert(pcap, &hdr); /* Convert the packet header to the correct format. */
-
-    if (fread(rte_pktmbuf_mtod(m, char *), 1, hdr.incl_len, pcap->fp) == 0)
-        rte_exit(EXIT_FAILURE, "%s: failed to read packet data from PCAP file\n", __func__);
-
-    m->pool     = mp;
-    m->next     = NULL;
-    m->data_len = hdr.incl_len;
-    m->pkt_len  = hdr.incl_len;
-    m->port     = 0;
-    m->ol_flags = 0;
 }
 
 int
@@ -170,7 +199,7 @@ pktgen_pcap_open(void)
     struct rte_mempool *mp;
     char name[64] = {0};
     uint16_t sid;
-    uint32_t pkt_count;
+    uint32_t nq, q;
 
     for (int pid = 0; pid < RTE_MAX_ETHPORTS; pid++) {
         if ((pcap = pcap_info_list[pid]) == NULL)
@@ -187,26 +216,54 @@ pktgen_pcap_open(void)
 
         pcap_get_info(pcap);
 
-        pkt_count = pcap->pkt_count;
-        if (pkt_count == 0) {
+        if (pcap->pkt_count == 0) {
             fclose(pcap->fp);
             rte_exit(EXIT_FAILURE, "%s: PCAP file is empty: %s\n", __func__, pcap->filename);
         }
-        if (pkt_count < ((uint32_t)pktgen.nb_txd * 4))
-            pkt_count = ((uint32_t)pktgen.nb_txd * 4);
 
-        snprintf(name, sizeof(name), "pcap-%d", pid);
-        uint32_t dataroom =
-            RTE_ALIGN_CEIL(pcap->max_pkt_size + RTE_PKTMBUF_HEADROOM, RTE_CACHE_LINE_SIZE);
-        mp = rte_pktmbuf_pool_create(name, pkt_count, 0, DEFAULT_PRIV_SIZE, dataroom, sid);
-        if (mp == NULL)
-            rte_exit(EXIT_FAILURE,
-                     "Cannot create mbuf pool (%s) port %d, nb_mbufs %d, socket_id %d: %s", name,
-                     pid, pcap->pkt_count, sid, rte_strerror(rte_errno));
+        /* One replay queue per TX queue: sets of records never overlap, so the
+         * capture order is preserved within each queue. */
+        nq = l2p_get_txcnt(pid);
+        if (nq == 0)
+            nq = 1;
+        if (nq > PCAP_MAX_QUEUES)
+            nq = PCAP_MAX_QUEUES;
+        if (nq > pcap->pkt_count)
+            nq = pcap->pkt_count;
 
-        pcap->mp = mp;
+        /* Enough mbufs per queue to keep the TX ring busy plus some slack,
+         * rounded up to a whole number of passes over the file so each pool
+         * cycles cleanly without exposing uninitialised buffers. */
+        uint32_t cnt_min, reps, need, dataroom;
 
-        rte_mempool_obj_iter(mp, mbuf_iterate_cb, pcap);
+        need    = (uint32_t)pktgen.nb_txd + 2u * MAX_PKT_TX_BURST;
+        cnt_min = pcap->pkt_count / nq;
+        if (cnt_min == 0)
+            cnt_min = 1;
+
+        reps = (need + cnt_min - 1) / cnt_min;
+        if (reps == 0)
+            reps = 1;
+
+        dataroom = RTE_ALIGN_CEIL(pcap->max_pkt_size + RTE_PKTMBUF_HEADROOM, RTE_CACHE_LINE_SIZE);
+
+        for (q = 0; q < nq; q++) {
+            uint32_t cnt = (pcap->pkt_count + nq - 1 - q) / nq;
+
+            snprintf(name, sizeof(name), "pcap-%d-%u", pid, q);
+            mp = rte_pktmbuf_pool_create(name, reps * cnt, 0, DEFAULT_PRIV_SIZE, dataroom, sid);
+            if (mp == NULL)
+                rte_exit(EXIT_FAILURE,
+                         "Cannot create mbuf pool (%s) port %d, nb_mbufs %d, socket_id %d: %s",
+                         name, pid, reps * cnt, sid, rte_strerror(rte_errno));
+            pcap->mp[q] = mp;
+        }
+        pcap->queue_cnt = nq;
+
+        pcap_load_file(pcap, pcap->mp, nq, reps);
+
+        printf("PCAP: %s -> %u record(s) over %u queue(s), avg %u bytes, %u mbufs/queue\n",
+               pcap->filename, pcap->pkt_count, nq, pcap->avg_pkt_size, reps * cnt_min);
 
         if (l2p_set_pcap_info(pid, pcap) < 0)
             pktgen_log_error("Error opening PCAP file: %s", pcap->filename);
@@ -222,15 +279,21 @@ pktgen_pcap_close(void)
     for (int pid = 0; pid < RTE_MAX_ETHPORTS; pid++) {
         pcap = pcap_info_list[pid];
         if (pcap == NULL)
-            return;
+            continue;
+
+        for (uint32_t q = 0; q < pcap->queue_cnt; q++) {
+            if (pcap->mp[q])
+                rte_mempool_free(pcap->mp[q]);
+            pcap->mp[q] = NULL;
+        }
+        pcap->queue_cnt = 0;
 
         if (pcap->filename)
             free(pcap->filename);
         if (pcap->fp)
             fclose(pcap->fp);
-        if (pcap->mp)
-            rte_mempool_free(pcap->mp);
         rte_free(pcap);
+        pcap_info_list[pid] = NULL;
     }
 }
 

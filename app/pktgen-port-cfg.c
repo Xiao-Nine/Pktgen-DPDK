@@ -634,6 +634,13 @@ pktgen_config_ports(void)
 
         pktgen_log_info("   Setup random bits");
         pktgen_rnd_bits_init(&pinfo->rnd_bitfields);
+
+        /* Resolve the initial rate target so the port is paced correctly from
+         * the very first burst. The link state is re-polled by the stats timer
+         * and the rate is re-resolved whenever it changes. */
+        pktgen_get_link_status(pinfo);
+        pktgen_rate_reset(pinfo);
+        pktgen_packet_rate(pinfo);
     }
 
     /* Clear the log information by putting a blank line */

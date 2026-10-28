@@ -226,6 +226,12 @@ void single_set_pkt_size(port_info_t *pinfo, uint16_t size);
 /** Set the TX rate as a percentage string (e.g. "100" or "50.5"). */
 void single_set_tx_rate(port_info_t *pinfo, const char *rate);
 
+/** Set an absolute TX packet rate in packets per second (0 disables pacing). */
+void single_set_tx_pps(port_info_t *pinfo, uint64_t pps);
+
+/** Set an absolute TX bandwidth in L1 bits per second (0 disables pacing). */
+void single_set_tx_bps(port_info_t *pinfo, uint64_t bps);
+
 /** Set the jitter threshold in microseconds. */
 void single_set_jitter(port_info_t *pinfo, uint64_t threshold);
 

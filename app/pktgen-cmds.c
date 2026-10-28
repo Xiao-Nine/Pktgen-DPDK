@@ -141,6 +141,10 @@ pktgen_script_save(char *path)
                 rte_atomic64_read(&pinfo->transmit_count));
         fprintf(fd, "set %d size %d\n", pinfo->pid, pkt->pkt_size + RTE_ETHER_CRC_LEN);
         fprintf(fd, "set %d rate %g\n", pinfo->pid, pinfo->tx_rate);
+        if (pinfo->rate_mode == RATE_PPS)
+            fprintf(fd, "set %d pps %" PRIu64 "\n", pinfo->pid, pinfo->rate_pps_cfg);
+        else if (pinfo->rate_mode == RATE_BPS)
+            fprintf(fd, "set %d bps %" PRIu64 "\n", pinfo->pid, pinfo->rate_bps_cfg);
         fprintf(fd, "set %d rxburst %d\n", pinfo->pid, pinfo->rx_burst);
         fprintf(fd, "set %d txburst %d\n", pinfo->pid, pinfo->tx_burst);
         fprintf(fd, "set %d sport %d\n", pinfo->pid, pkt->sport);
@@ -472,6 +476,12 @@ pktgen_lua_save(char *path)
         fprintf(fd, "pktgen.set('%d', 'size', %d);\n", pinfo->pid,
                 pkt->pkt_size + RTE_ETHER_CRC_LEN);
         fprintf(fd, "pktgen.set('%d', 'rate', %g);\n", pinfo->pid, pinfo->tx_rate);
+        if (pinfo->rate_mode == RATE_PPS)
+            fprintf(fd, "pktgen.set('%d', 'pps', %" PRIu64 ");\n", pinfo->pid,
+                    pinfo->rate_pps_cfg);
+        else if (pinfo->rate_mode == RATE_BPS)
+            fprintf(fd, "pktgen.set('%d', 'bps', %" PRIu64 ");\n", pinfo->pid,
+                    pinfo->rate_bps_cfg);
         fprintf(fd, "pktgen.set('%d', 'txburst', %d);\n", pinfo->pid, pinfo->tx_burst);
         fprintf(fd, "pktgen.set('%d', 'rxburst', %d);\n", pinfo->pid, pinfo->rx_burst);
         fprintf(fd, "pktgen.set('%d', 'sport', %d);\n", pinfo->pid, pkt->sport);
@@ -829,12 +839,24 @@ char *
 pktgen_transmit_count_rate(int port, char *buff, int len)
 {
     port_info_t *pinfo = l2p_get_port_pinfo(port);
+    char rate[32];
+
+    switch (pinfo->rate_mode) {
+    case RATE_PPS:
+        snprintf(rate, sizeof(rate), "%" PRIu64 " pps", pinfo->rate_pps_cfg);
+        break;
+    case RATE_BPS:
+        snprintf(rate, sizeof(rate), "%" PRIu64 " Mbps", pinfo->rate_bps_cfg / Million);
+        break;
+    default:
+        snprintf(rate, sizeof(rate), "%g%%", pinfo->tx_rate);
+        break;
+    }
 
     if (rte_atomic64_read(&pinfo->transmit_count) == 0)
-        snprintf(buff, len, "Forever /%g%%", pinfo->tx_rate);
+        snprintf(buff, len, "Forever /%s", rate);
     else
-        snprintf(buff, len, "%" PRIu64 " /%g%%", rte_atomic64_read(&pinfo->transmit_count),
-                 pinfo->tx_rate);
+        snprintf(buff, len, "%" PRIu64 " /%s", rte_atomic64_read(&pinfo->transmit_count), rate);
 
     return buff;
 }
@@ -1267,6 +1289,11 @@ pktgen_start_transmitting(port_info_t *pinfo)
         if (rte_atomic64_read(&pinfo->current_tx_count) == 0)
             pktgen_set_port_flags(pinfo, SEND_FOREVER);
 
+        /* Start with an empty token bucket so the first bursts do not pile up
+         * an unused budget while the port was idle. */
+        pktgen_rate_reset(pinfo);
+        pktgen_packet_rate(pinfo);
+
         pktgen_set_port_flags(pinfo, SETUP_TRANSMIT_PKTS);
         pktgen_setup_packets(pinfo->pid);        // will clear the SETUP_TRANSMIT_PKTS flag
         pktgen_set_port_flags(pinfo, SENDING_PACKETS);
@@ -1529,7 +1556,11 @@ enable_pcap(port_info_t *pinfo, uint32_t state)
             pktgen_clr_port_flags(pinfo, EXCLUSIVE_MODES);
             pktgen_set_port_flags(pinfo, SEND_SINGLE_PKTS);
         }
-        pinfo->tx_cycles = 0;
+
+        /* The replay uses the same rate limiter as the generated traffic: the
+         * average wire size of the capture file drives the pacing budget. */
+        pktgen_rate_reset(pinfo);
+        pktgen_packet_rate(pinfo);
     }
 }
 
@@ -2284,15 +2315,18 @@ pktgen_port_defaults(uint16_t pid)
     rte_atomic64_set(&pinfo->transmit_count, DEFAULT_TX_COUNT);
     rte_atomic64_init(&pinfo->current_tx_count);
 
-    pinfo->tx_rate   = DEFAULT_TX_RATE;
-    pinfo->tx_burst  = DEFAULT_PKT_TX_BURST;
-    pinfo->rx_burst  = DEFAULT_PKT_RX_BURST;
-    pinfo->vlanid    = DEFAULT_VLAN_ID;
-    pinfo->cos       = DEFAULT_COS;
-    pinfo->tos       = DEFAULT_TOS;
-    pinfo->seqCnt    = 0;
-    pinfo->seqIdx    = 0;
-    pinfo->prime_cnt = DEFAULT_PRIME_COUNT;
+    pinfo->rate_mode    = RATE_PCT;
+    pinfo->rate_pps_cfg = 0;
+    pinfo->rate_bps_cfg = 0;
+    pinfo->tx_rate      = DEFAULT_TX_RATE;
+    pinfo->tx_burst     = DEFAULT_PKT_TX_BURST;
+    pinfo->rx_burst     = DEFAULT_PKT_RX_BURST;
+    pinfo->vlanid       = DEFAULT_VLAN_ID;
+    pinfo->cos          = DEFAULT_COS;
+    pinfo->tos          = DEFAULT_TOS;
+    pinfo->seqCnt       = 0;
+    pinfo->seqIdx       = 0;
+    pinfo->prime_cnt    = DEFAULT_PRIME_COUNT;
 
     if (rte_eth_macaddr_get(pid, &pinfo->src_mac) < 0)
         pktgen_log_panic("Can't get MAC address: port=%u", pid);
@@ -2613,8 +2647,7 @@ single_set_tx_burst(port_info_t *pinfo, uint32_t burst)
         burst = 1;
     else if (burst > MAX_PKT_TX_BURST)
         burst = MAX_PKT_TX_BURST;
-    pinfo->tx_burst  = burst;
-    pinfo->tx_cycles = 0;
+    pinfo->tx_burst = burst;
 
     pktgen_packet_rate(pinfo);
 }
@@ -2658,7 +2691,11 @@ single_set_rx_burst(port_info_t *pinfo, uint32_t burst)
 void
 debug_set_tx_cycles(port_info_t *pinfo, uint32_t cycles)
 {
+    pinfo->rate_mode = RATE_CYCLES;
     pinfo->tx_cycles = cycles;
+
+    pktgen_rate_reset(pinfo);
+    pktgen_packet_rate(pinfo);
 }
 
 /**
@@ -2692,6 +2729,7 @@ single_set_pkt_size(port_info_t *pinfo, uint16_t size)
     pkt->pkt_size = (size - RTE_ETHER_CRC_LEN);
 
     pktgen_packet_ctor(pinfo, SINGLE_PKT, -1);
+    pktgen_rate_reset(pinfo);
     pktgen_packet_rate(pinfo);
 }
 
@@ -2734,13 +2772,63 @@ single_set_tx_rate(port_info_t *pinfo, const char *r)
 {
     double rate = strtod(r, NULL);
 
-    if (rate == 0)
+    if (rate <= 0)
         rate = 0.01;
     else if (rate > 100.00)
         rate = 100.00;
-    pinfo->tx_rate   = rate;
-    pinfo->tx_cycles = 0;
 
+    pinfo->rate_mode = RATE_PCT;
+    pinfo->tx_rate   = rate;
+
+    pktgen_rate_reset(pinfo);
+    pktgen_packet_rate(pinfo);
+}
+
+/**
+ *
+ * single_set_tx_pps - Set an absolute packet rate in packets per second.
+ *
+ * DESCRIPTION
+ * Pace the port at an exact packets per second rate. The value covers the whole
+ * port and is split evenly over the TX queues. A value of zero disables pacing.
+ *
+ * RETURNS: N/A
+ *
+ * SEE ALSO:
+ */
+
+void
+single_set_tx_pps(port_info_t *pinfo, uint64_t pps)
+{
+    pinfo->rate_mode    = pps ? RATE_PPS : RATE_PCT;
+    pinfo->rate_pps_cfg = pps;
+
+    pktgen_rate_reset(pinfo);
+    pktgen_packet_rate(pinfo);
+}
+
+/**
+ *
+ * single_set_tx_bps - Set an absolute bandwidth in bits per second.
+ *
+ * DESCRIPTION
+ * Pace the port at an exact wire bandwidth. The value is expressed at layer 1,
+ * which means the preamble, the inter frame gap and the FCS are included, the
+ * same unit that link speeds and NIC counters use. A value of zero disables
+ * pacing.
+ *
+ * RETURNS: N/A
+ *
+ * SEE ALSO:
+ */
+
+void
+single_set_tx_bps(port_info_t *pinfo, uint64_t bps)
+{
+    pinfo->rate_mode    = bps ? RATE_BPS : RATE_PCT;
+    pinfo->rate_bps_cfg = bps;
+
+    pktgen_rate_reset(pinfo);
     pktgen_packet_rate(pinfo);
 }
 
@@ -3627,6 +3715,9 @@ range_set_pkt_size(port_info_t *pinfo, char *what, uint16_t size)
         else if (!strcmp(what, "max") || !strcmp(what, "maximum"))
             pinfo->range.pkt_size_max = (size - RTE_ETHER_CRC_LEN);
     }
+
+    /* A changed packet size changes the wire size, hence the pacing budget. */
+    pktgen_packet_rate(pinfo);
 }
 
 /**

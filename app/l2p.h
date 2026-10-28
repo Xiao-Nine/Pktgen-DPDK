@@ -528,23 +528,49 @@ l2p_set_pcap_info(uint16_t pid, pcap_info_t *pcap_info)
 }
 
 /**
- * Return the PCAP mempool for a port.
+ * Return the PCAP mempool for a port (first TX queue).
  *
  * @param pid
  *   Port ID to look up.
  * @return
  *   Pointer to the PCAP mempool, or NULL on error.
  */
+static __inline__ struct rte_mempool *l2p_get_pcap_mp_q(uint16_t pid, uint16_t qid);
+
 static __inline__ struct rte_mempool *
 l2p_get_pcap_mp(uint16_t pid)
 {
+    return l2p_get_pcap_mp_q(pid, 0);
+}
+
+/**
+ * Return the PCAP mempool used by a specific TX queue of a port.
+ *
+ * Each TX queue owns its own share of the capture file so that the replay order
+ * is preserved. Queues beyond the number of replay pools wrap around.
+ *
+ * @param pid
+ *   Port ID to look up.
+ * @param qid
+ *   TX queue ID for the port.
+ * @return
+ *   Pointer to the PCAP mempool, or NULL on error.
+ */
+static __inline__ struct rte_mempool *
+l2p_get_pcap_mp_q(uint16_t pid, uint16_t qid)
+{
     l2p_t *l2p = l2p_get();
+    pcap_info_t *pcap;
 
     if (pid >= RTE_MAX_ETHPORTS || l2p->ports[pid].pid >= RTE_MAX_ETHPORTS ||
         l2p->ports[pid].pcap_info == NULL)
         L2P_NULL_RET("Invalid port ID %u", pid);
 
-    return l2p->ports[pid].pcap_info->mp;
+    pcap = l2p->ports[pid].pcap_info;
+    if (pcap->queue_cnt == 0)
+        L2P_NULL_RET("No PCAP pool for port %u", pid);
+
+    return pcap->mp[qid % pcap->queue_cnt];
 }
 
 /**
@@ -565,7 +591,9 @@ l2p_set_pcap_mp(uint16_t pid, struct rte_mempool *mp)
     if (pid >= RTE_MAX_ETHPORTS || l2p->ports[pid].pid >= RTE_MAX_ETHPORTS)
         L2P_ERR_RET("Invalid port ID %u", pid);
 
-    l2p->ports[pid].pcap_info->mp = mp;
+    l2p->ports[pid].pcap_info->mp[0] = mp;
+    if (l2p->ports[pid].pcap_info->queue_cnt == 0)
+        l2p->ports[pid].pcap_info->queue_cnt = 1;
     return 0;
 }
 

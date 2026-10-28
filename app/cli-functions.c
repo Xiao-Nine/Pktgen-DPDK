@@ -527,6 +527,8 @@ range_cmd(int argc, char **argv)
 static struct cli_map set_map[] = {
     {10, "set %P %|" set_types " %d"},
     {11, "set %P jitter %D"},
+    {12, "set %P pps %D"},
+    {13, "set %P bps %D"},
     {20, "set %P type %|arp|ipv4|ipv6|ip4|ip6|vlan"},
     {21, "set %P proto %|udp|tcp|icmp"},
     {22, "set %P src mac %m"},
@@ -558,6 +560,8 @@ static const char *set_help[] = {
     "set <portlist> count <value>       - number of packets to transmit",
     "set <portlist> size <value>        - size of the packet to transmit",
     "set <portlist> rate <percent>      - Packet rate in percentage",
+    "set <portlist> pps <packets/sec>   - Absolute packet rate for the whole port",
+    "set <portlist> bps <bits/sec>      - Absolute wire bandwidth, L1 bits/sec",
     "set <portlist> txburst|burst <value> - number of packets in a TX burst",
     "set <portlist> rxburst <value>     - number of packets in a RX burst",
     "set <portlist> tx_cycles <value>   - DEBUG to set the number of cycles per TX burst",
@@ -687,6 +691,12 @@ set_cmd(int argc, char **argv)
         break;
     case 11:
         foreach_port(portlist, single_set_jitter(pinfo, strtoull(argv[3], NULL, 0)));
+        break;
+    case 12:
+        foreach_port(portlist, single_set_tx_pps(pinfo, strtoull(argv[3], NULL, 0)));
+        break;
+    case 13:
+        foreach_port(portlist, single_set_tx_bps(pinfo, strtoull(argv[3], NULL, 0)));
         break;
     case 20:
         foreach_port(portlist, single_set_pkt_type(pinfo, argv[3]));

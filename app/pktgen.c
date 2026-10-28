@@ -47,12 +47,16 @@ next_poisson_time(double rateParameter)
 
 /**
  *
- * wire_size - Calculate the wire size of the data in bits to be sent.
+ * pktgen_wire_size - Average wire size of the packets to be sent, in bits.
  *
  * DESCRIPTION
- * Calculate the number of bytes/bits in a burst of traffic.
+ * Return the average number of bits that a packet occupies on the wire,
+ * including the preamble, the inter frame gap and the FCS. For a PCAP replay
+ * the exact average of the capture file is used instead of a rounded average
+ * packet size, so that a bandwidth target is not biased by the truncation of
+ * the average.
  *
- * RETURNS: Number of bytes in a burst of packets.
+ * RETURNS: Number of bits per packet.
  *
  * SEE ALSO:
  */
@@ -64,24 +68,43 @@ pktgen_wire_size(port_info_t *pinfo)
     if (pktgen_tst_port_flags(pinfo, SEND_PCAP_PKTS)) {
         pcap_info_t *pcap = l2p_get_pcap(pinfo->pid);
 
-        size = WIRE_SIZE(pcap->avg_pkt_size, uint64_t);
-    } else {
-        if (unlikely(pinfo->seqCnt > 0)) {
-            for (i = 0; i < pinfo->seqCnt; i++)
-                size += WIRE_SIZE(pinfo->seq_pkt[i].pkt_size, uint64_t);
-            size = size / pinfo->seqCnt; /* Calculate the average sized packet */
-        } else
-            size = WIRE_SIZE(pinfo->seq_pkt[SINGLE_PKT].pkt_size, uint64_t);
+        if (pcap && pcap->pkt_count)
+            return ((pcap->total_bytes + (uint64_t)pcap->pkt_count * PKT_OVERHEAD_SIZE) * 8) /
+                   pcap->pkt_count;
+
+        return WIRE_BITS(RTE_ETHER_MAX_LEN - RTE_ETHER_CRC_LEN);
     }
-    return (size * 8);
+
+    if (pktgen_tst_port_flags(pinfo, SEND_RANGE_PKTS)) {
+        range_info_t *range = &pinfo->range;
+
+        size = (uint64_t)(range->pkt_size_min + range->pkt_size_max) / 2;
+        if (size == 0)
+            size = range->pkt_size;
+        return WIRE_BITS(size);
+    }
+
+    if (unlikely(pinfo->seqCnt > 0)) {
+        for (i = 0; i < pinfo->seqCnt; i++)
+            size += WIRE_SIZE(pinfo->seq_pkt[i].pkt_size, uint64_t);
+        size = size / pinfo->seqCnt; /* Calculate the average sized packet */
+    } else
+        size = WIRE_SIZE(pinfo->seq_pkt[SINGLE_PKT].pkt_size, uint64_t);
+
+    return size * 8;
 }
 
 /**
  *
- * pktgen_packet_rate - Calculate the transmit rate.
+ * pktgen_packet_rate - Recompute the transmit rate of a port.
  *
  * DESCRIPTION
- * Calculate the number of cycles to wait between sending bursts of traffic.
+ * Resolve the rate target of the port into a per queue token bucket rate.
+ * The target can be a percentage of the link bandwidth, an absolute packet
+ * rate, an absolute wire bandwidth or a raw cycle count.
+ *
+ * A rate of zero disables pacing, which means the port transmits as fast as the
+ * NIC accepts the packets (historic behaviour of "tx_cycles == 0").
  *
  * RETURNS: N/A
  *
@@ -90,32 +113,184 @@ pktgen_wire_size(port_info_t *pinfo)
 void
 pktgen_packet_rate(port_info_t *port)
 {
-    uint64_t link_speed, pps, cpb, txcnt;
+    uint64_t hz, nq, qid, units_per_q, units_total, cap, burst_cost;
+    uint64_t wire_bits;
+    uint16_t in_bits = 1;
 
     if (!port)
         return;
 
-    // link speed in Megabits per second and tx_rate in percentage
-    if (port->link.link_speed == 0 || port->tx_rate == 0) {
-        port->tx_cycles = 0;
-        port->tx_pps    = 0;
+    wire_bits          = pktgen_wire_size(port);
+    port->tx_wire_bits = wire_bits;
+
+    nq = l2p_get_txcnt(port->pid);
+    if (nq == 0)
+        nq = 1;
+    if (nq > MAX_QUEUES_PER_PORT)
+        nq = MAX_QUEUES_PER_PORT;
+
+    hz = pktgen_get_timer_hz();
+
+    /* Resolve the configured target into a per queue budget rate. */
+    switch (port->rate_mode) {
+    case RATE_PPS:
+        in_bits     = 0;
+        units_total = port->rate_pps_cfg;
+        units_per_q = units_total / nq;
+        break;
+
+    case RATE_BPS:
+        in_bits     = 1;
+        units_total = port->rate_bps_cfg;
+        units_per_q = units_total / nq;
+        break;
+
+    case RATE_CYCLES:
+        /* Debug knob: the requested number of cycles between bursts of
+         * tx_burst packets, applied independently per queue. */
+        in_bits     = 0;
+        units_per_q = port->tx_cycles ? ((uint64_t)port->tx_burst * hz / port->tx_cycles) : 0;
+        units_total = units_per_q * nq;
+        break;
+
+    case RATE_PCT:
+    default:
+        in_bits = 1;
+        units_total = 0;
+        if (port->link.link_speed > 0 && port->tx_rate > 0)
+            units_total = (uint64_t)(((double)port->link.link_speed * (double)Million *
+                                      port->tx_rate) /
+                                     100.0);
+        units_per_q = units_total / nq;
+        break;
+    }
+
+    port->rate_bps = in_bits ? units_total : (units_total * wire_bits);
+    port->tx_pps   = in_bits ? (wire_bits ? units_total / wire_bits : 0) : units_total;
+
+    if (port->rate_mode != RATE_CYCLES) {
+        /* Keep tx_cycles meaningful for the debug display. */
+        uint64_t pps_per_q = in_bits ? (wire_bits ? units_per_q / wire_bits : 0) : units_per_q;
+
+        port->tx_cycles = (pps_per_q && port->tx_burst)
+                              ? ((uint64_t)port->tx_burst * hz / pps_per_q)
+                              : 0;
+    }
+
+    for (qid = 0; qid < nq; qid++) {
+        pace_t *p = &port->per_queue[qid].pace;
+
+        p->in_bits    = in_bits;
+        p->rate_units = units_per_q;
+        p->min_cost   = in_bits ? WIRE_BITS(PKT_OVERHEAD_SIZE) : 1;
+
+        /* Budget that may accumulate while nothing is transmitted: about one
+         * millisecond worth of traffic, but never less than a single full burst
+         * so that a paced burst can always be assembled. */
+        cap        = units_per_q ? (units_per_q / 1000) : 0;
+        burst_cost = in_bits ? (wire_bits * port->tx_burst) : port->tx_burst;
+        if (cap < burst_cost)
+            cap = burst_cost;
+        if (cap < p->min_cost)
+            cap = p->min_cost;
+        p->cap = cap;
+
+        if (units_per_q == 0) {
+            p->credit = 0;
+            p->frac   = 0;
+        } else if (p->credit > p->cap)
+            p->credit = p->cap;
+    }
+}
+
+/**
+ * Reset the rate limiter state of a port.
+ *
+ * Discards the accumulated budget so a configuration change takes effect
+ * immediately instead of being averaged with the previous settings.
+ *
+ * @param pinfo  Per-port state.
+ */
+void pktgen_rate_reset(port_info_t *pinfo)
+{
+    uint16_t qid, nq;
+
+    if (!pinfo)
+        return;
+
+    nq = l2p_get_txcnt(pinfo->pid);
+    if (nq == 0)
+        nq = 1;
+    if (nq > MAX_QUEUES_PER_PORT)
+        nq = MAX_QUEUES_PER_PORT;
+
+    for (qid = 0; qid < nq; qid++) {
+        pace_t *p = &pinfo->per_queue[qid].pace;
+
+        p->credit   = 0;
+        p->frac     = 0;
+        p->last_tsc = 0;
+    }
+}
+
+/**
+ * Cost of a packet for the rate limiter of a queue.
+ *
+ * @param p  Pacing state of the queue.
+ * @param m  Packet that is about to be sent.
+ * @return   Budget that the packet consumes.
+ */
+static __rte_always_inline uint64_t
+pkt_pace_cost(const pace_t *p, const struct rte_mbuf *m)
+{
+    return p->in_bits ? WIRE_BITS(m->pkt_len) : 1;
+}
+
+/**
+ * Refill the token bucket of a queue with the budget earned since the last call.
+ *
+ * Unlike a phase-reset based pacer, a late visit never loses the budget the
+ * queue was entitled to: it simply accumulates (up to cap) and the next bursts
+ * make up for it.
+ *
+ * @param p    Pacing state of the queue.
+ * @param now  Current timestamp, in timer ticks.
+ */
+static inline void
+pktgen_pace_refill(pace_t *p, uint64_t now)
+{
+    uint64_t dt, hz, num;
+
+    if (p->rate_units == 0) { /* pacing disabled */
+        p->credit   = 0;
+        p->frac     = 0;
+        p->last_tsc = now;
         return;
     }
 
-    // total link speed in bits per second
-    link_speed = (uint64_t)port->link.link_speed * Million;
+    if (p->last_tsc == 0) { /* first visit, just anchor the clock */
+        p->last_tsc = now;
+        return;
+    }
 
-    txcnt = l2p_get_txcnt(port->pid);
+    dt = now - p->last_tsc;
+    if (dt == 0)
+        return;
+    p->last_tsc = now;
 
-    // packets per second per thread based on requested (tx_rate/txcnt)
-    pps = (((link_speed / pktgen_wire_size(port)) * (port->tx_rate / txcnt)) / 100);
-    pps = ((pps > 0) ? pps : 1);
+    hz = pktgen_get_timer_hz();
 
-    // Do all multiplications first to reduce rounding errors.
-    // Add pps/2 to do rounding instead of truncation.
-    cpb             = (pps / 2 + (uint64_t)port->tx_burst * rte_get_timer_hz()) / pps;
-    port->tx_cycles = cpb;
-    port->tx_pps    = pps;
+    /* 2ms is far more than the bucket can hold, clamping keeps the fixed point
+     * math below well inside 64 bits. */
+    if (dt > (hz / 500))
+        dt = hz / 500;
+
+    num     = dt * p->rate_units + p->frac;
+    p->frac = num % hz;
+
+    p->credit += num / hz;
+    if (p->credit > p->cap)
+        p->credit = p->cap;
 }
 
 /**
@@ -280,21 +455,36 @@ pktgen_tstamp_inject(port_info_t *pinfo, uint16_t qid)
     }
 }
 
+/** Number of times a burst is retried when the TX ring is full. */
+#define MAX_TX_RETRIES 64
+
 void
 tx_send_packets(port_info_t *pinfo, uint16_t qid, struct rte_mbuf **pkts, uint16_t nb_pkts)
 {
     if (nb_pkts) {
-        uint16_t sent, to_send = nb_pkts;
+        uint16_t sent, tries = 0, to_send = nb_pkts;
         qstats_t *qs = &pinfo->stats.qstats[qid];
 
-        qs->q_opackets += nb_pkts;
         if (pktgen_tst_port_flags(pinfo, SEND_RANDOM_PKTS))
             pktgen_rnd_bits_apply(pinfo, pkts, to_send, NULL);
 
         do {
             sent = rte_eth_tx_burst(pinfo->pid, qid, pkts, to_send);
+            qs->q_opackets += sent;
+
             to_send -= sent;
             pkts += sent;
+
+            if (sent == 0 && to_send) {
+                /* Never spin forever on a full ring: report the loss instead of
+                 * stalling the whole lcore (RX, pacing and stats included). */
+                if (++tries >= MAX_TX_RETRIES) {
+                    qs->q_ring_full += to_send;
+                    rte_pktmbuf_free_bulk(pkts, to_send);
+                    break;
+                }
+                rte_pause();
+            }
         } while (to_send > 0);
 
         if (qid == 0 && pktgen_tst_port_flags(pinfo, SEND_LATENCY_PKTS))
@@ -927,22 +1117,122 @@ pktgen_setup_packets(uint16_t pid)
 void
 pktgen_send_pkts(port_info_t *pinfo, uint16_t qid, struct rte_mempool *mp)
 {
-    uint64_t txCnt;
-    struct rte_mbuf **pkts = pinfo->per_queue[qid].tx_pkts;
+    per_queue_t *pq        = &pinfo->per_queue[qid];
+    pace_t *pace           = &pq->pace;
+    struct rte_mbuf **pkts = pq->tx_pkts;
+    qstats_t *qs           = &pinfo->stats.qstats[qid];
+    uint16_t nb, nb_max, i, sent, fit;
+    uint64_t batch_cost, batch_bytes;
+
+    if (unlikely(mp == NULL))
+        return;
+
+    /* 1) Restore the packets that could not be sent on the previous pass. */
+    nb = pq->carry_nb;
+    for (i = 0; i < nb; i++)
+        pkts[i] = pq->carry[i];
+    pq->carry_nb = 0;
+
+    /* 2) How many more packets may be fetched on this pass? */
+    nb_max = pinfo->tx_burst;
+    if (nb_max > MAX_PKT_TX_BURST)
+        nb_max = MAX_PKT_TX_BURST;
 
     if (!pktgen_tst_port_flags(pinfo, SEND_FOREVER)) {
-        txCnt = pkt_atomic64_tx_count(&pinfo->current_tx_count, pinfo->tx_burst);
-        if (txCnt == 0) {
+        uint64_t txCnt = pkt_atomic64_tx_count(&pinfo->current_tx_count, nb_max - nb);
+
+        if (txCnt == 0 && nb == 0) {
             pktgen_clr_port_flags(pinfo, SENDING_PACKETS);
             return;
         }
-        if (txCnt > pinfo->tx_burst)
-            txCnt = pinfo->tx_burst;
-    } else
-        txCnt = pinfo->tx_burst;
+        nb_max = nb + (uint16_t)txCnt;
+    }
 
-    if (rte_mempool_get_bulk(mp, (void **)pkts, txCnt) == 0)
-        tx_send_packets(pinfo, qid, pkts, txCnt);
+    if (nb < nb_max) {
+        uint16_t need = nb_max - nb;
+
+        if (rte_mempool_get_bulk(mp, (void **)&pkts[nb], need) != 0)
+            qs->q_mbuf_fail++; /* Keep going with what we have */
+        else
+            nb += need;
+    }
+
+    if (nb == 0)
+        return;
+
+    /* 3) Trim the batch to what the rate limiter allows right now. */
+    if (pace->rate_units) {
+        uint64_t budget = pace->credit;
+        uint64_t used   = 0;
+
+        for (fit = 0; fit < nb; fit++) {
+            uint64_t cost = pkt_pace_cost(pace, pkts[fit]);
+
+            if ((used + cost) > budget)
+                break;
+            used += cost;
+        }
+
+        if (fit < nb) {
+            /* Hold the surplus back instead of dropping or blocking: the order
+             * of the replay stream is preserved and the budget will catch up. */
+            for (i = fit; i < nb; i++)
+                pq->carry[pq->carry_nb++] = pkts[i];
+        }
+
+        if (fit == 0)
+            return; /* nothing can be sent yet, come back on the next pass */
+
+        nb = fit;
+    }
+
+    /* 4) Transmit without ever blocking on a full TX ring.
+     * The mbufs belong to the driver once they are handed over, so everything
+     * that is needed from them is read up front. */
+    if (pktgen_tst_port_flags(pinfo, SEND_RANDOM_PKTS))
+        pktgen_rnd_bits_apply(pinfo, pkts, nb, NULL);
+
+    batch_cost  = 0;
+    batch_bytes = 0;
+    for (i = 0; i < nb; i++) {
+        batch_bytes += pkts[i]->pkt_len;
+        if (pace->rate_units)
+            batch_cost += pkt_pace_cost(pace, pkts[i]);
+    }
+
+    sent = rte_eth_tx_burst(pinfo->pid, qid, pkts, nb);
+
+    if (sent < nb) {
+        for (i = sent; i < nb; i++)
+            pq->carry[pq->carry_nb++] = pkts[i];
+        qs->q_ring_full += (uint64_t)(nb - sent);
+    }
+
+    if (sent) {
+        uint64_t ccost = batch_cost, cbytes = batch_bytes;
+
+        if (sent < nb) {
+            /* Pro rata share for a partially accepted burst; the carried
+             * packets are charged when they finally leave the box. */
+            ccost  = (batch_cost / nb) * sent;
+            cbytes = (batch_bytes / nb) * sent;
+        }
+
+        /* 5) Charge the rate limiter for what really left the box. */
+        if (pace->rate_units && ccost)
+            pace->credit = (pace->credit > ccost) ? (pace->credit - ccost) : 0;
+
+        qs->q_opackets += sent;
+        qs->q_obytes += cbytes;
+
+        if (qid == 0 && pktgen_tst_port_flags(pinfo, SEND_LATENCY_PKTS))
+            pktgen_tstamp_inject(pinfo, qid);
+    }
+
+    /* 6) Stop only when the requested count is exhausted and nothing is pending. */
+    if (!pktgen_tst_port_flags(pinfo, SEND_FOREVER) && pq->carry_nb == 0 &&
+        rte_atomic64_read(&pinfo->current_tx_count) == 0)
+        pktgen_clr_port_flags(pinfo, SENDING_PACKETS);
 }
 
 /**
@@ -969,10 +1259,31 @@ pktgen_main_transmit(port_info_t *pinfo, uint16_t qid)
         struct rte_mempool *mp = l2p_get_tx_mp(pid, qid);
 
         if (pktgen_tst_port_flags(pinfo, SEND_PCAP_PKTS))
-            mp = l2p_get_pcap_mp(pid);
+            mp = l2p_get_pcap_mp_q(pid, qid);
 
         pktgen_send_pkts(pinfo, qid, mp);
     }
+}
+
+/**
+ * Service the rate limiter of a TX queue and transmit a paced burst.
+ *
+ * @param pinfo  Per-port state.
+ * @param qid    TX queue to service.
+ * @param now    Current timestamp, in timer ticks.
+ */
+static inline void
+pktgen_pace_transmit(port_info_t *pinfo, uint16_t qid, uint64_t now)
+{
+    pace_t *pace = &pinfo->per_queue[qid].pace;
+
+    pktgen_pace_refill(pace, now);
+
+    /* Wait until the bucket holds the cheapest possible packet. */
+    if (pace->rate_units && (pace->credit < pace->min_cost))
+        return;
+
+    pktgen_main_transmit(pinfo, qid);
 }
 
 /**
@@ -1039,7 +1350,7 @@ static void
 pktgen_main_rxtx_loop(void)
 {
     port_info_t *pinfo;
-    uint64_t curr_tsc, tx_next_cycle, tx_bond_cycle;
+    uint64_t curr_tsc, tx_bond_cycle;
     uint16_t pid, rx_qid, tx_qid, lid = rte_lcore_id();
 
     if (lid == rte_get_main_lcore()) {
@@ -1050,7 +1361,6 @@ pktgen_main_rxtx_loop(void)
     pinfo = l2p_get_pinfo_by_lcore(lid);
 
     curr_tsc      = pktgen_get_time();
-    tx_next_cycle = curr_tsc;
     tx_bond_cycle = curr_tsc + (pktgen_get_timer_hz() / 10);
 
     pid    = pinfo->pid;
@@ -1068,15 +1378,9 @@ pktgen_main_rxtx_loop(void)
 
         curr_tsc = pktgen_get_time();
 
-        /* Determine when is the next time to send packets */
-        const int64_t max_tx_lag =
-            DEFAULT_MAX_TX_LAG;        // Allow some lag, ideally make this configurable.
-        int64_t dt = curr_tsc - tx_next_cycle;
-        if (dt >= 0) {
-            tx_next_cycle = curr_tsc + pinfo->tx_cycles - (dt <= max_tx_lag ? dt : 0);
-            // Process TX
-            pktgen_main_transmit(pinfo, tx_qid);
-        }
+        /* Rate limited transmit: the token bucket makes up for a late pass. */
+        pktgen_pace_transmit(pinfo, tx_qid, curr_tsc);
+
         if (curr_tsc >= tx_bond_cycle) {
             tx_bond_cycle = curr_tsc + (pktgen_get_timer_hz() / 10);
             if (pktgen_tst_port_flags(pinfo, BONDING_TX_PACKETS))
@@ -1105,7 +1409,7 @@ pktgen_main_tx_loop(void)
 {
     uint16_t tx_qid, lid = rte_lcore_id();
     port_info_t *pinfo = l2p_get_pinfo_by_lcore(lid);
-    uint64_t curr_tsc, tx_next_cycle, tx_bond_cycle;
+    uint64_t curr_tsc, tx_bond_cycle;
 
     if (lid == rte_get_main_lcore()) {
         printf("Using %d initial lcore for Rx/Tx\n", lid);
@@ -1113,7 +1417,6 @@ pktgen_main_tx_loop(void)
     }
 
     curr_tsc      = pktgen_get_time();
-    tx_next_cycle = curr_tsc + pinfo->tx_cycles;
     tx_bond_cycle = curr_tsc + pktgen_get_timer_hz() / 10;
 
     tx_qid = l2p_get_txqid(lid);
@@ -1124,16 +1427,9 @@ pktgen_main_tx_loop(void)
     while (unlikely(pktgen.force_quit == 0)) {
         curr_tsc = pktgen_get_time();
 
-        /* Determine when is the next time to send packets */
-        const int64_t max_tx_lag =
-            DEFAULT_MAX_TX_LAG;        // Allow some lag, ideally make this configurable.
-        int64_t dt = curr_tsc - tx_next_cycle;
-        if (dt >= 0) {
-            tx_next_cycle = curr_tsc + pinfo->tx_cycles - (dt <= max_tx_lag ? dt : 0);
+        /* Rate limited transmit: the token bucket makes up for a late pass. */
+        pktgen_pace_transmit(pinfo, tx_qid, curr_tsc);
 
-            // Process TX
-            pktgen_main_transmit(pinfo, tx_qid);
-        }
         if (unlikely(curr_tsc >= tx_bond_cycle)) {
             tx_bond_cycle = curr_tsc + pktgen_get_timer_hz() / 10;
             if (pktgen_tst_port_flags(pinfo, BONDING_TX_PACKETS))
@@ -1303,15 +1599,15 @@ pktgen_page_display(void)
 static void *
 _timer_thread(void *arg)
 {
-    uint64_t process, page, prev;
+    uint64_t process, page;
 
     this_scrn = arg;
 
     pktgen.stats_timeout = pktgen.hz;
     pktgen.page_timeout  = UPDATE_DISPLAY_TICK_RATE;
 
-    page = prev = pktgen_get_time();
-    process     = page + pktgen.stats_timeout;
+    page    = pktgen_get_time();
+    process = page + pktgen.stats_timeout;
     page += pktgen.page_timeout;
 
     pktgen.timer_running = 1;
@@ -1322,17 +1618,25 @@ _timer_thread(void *arg)
         curr = pktgen_get_time();
 
         if (curr >= process) {
-            process = curr + pktgen.stats_timeout;
+            /* Advance the deadline rather than restarting it from "now", so the
+             * sampling period does not drift by the cost of the previous pass.
+             * The rate values themselves are normalized by the measured elapsed
+             * time, so a late pass can no longer skew them. */
+            process += pktgen.stats_timeout;
+            if (curr >= process) /* fell too far behind: resynchronise */
+                process = curr + pktgen.stats_timeout;
             pktgen_process_stats();
-            prev = curr;
         }
 
         if (curr >= page) {
-            page = curr + pktgen.page_timeout;
+            page += pktgen.page_timeout;
+            if (curr >= page)
+                page = curr + pktgen.page_timeout;
             pktgen_page_display();
         }
 
-        rte_pause();
+        /* Sleep instead of burning cycles of the main lcore on a spin loop. */
+        rte_delay_us_sleep(200);
     }
     return NULL;
 }

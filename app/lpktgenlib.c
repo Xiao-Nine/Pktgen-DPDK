@@ -274,6 +274,10 @@ pktgen_set(lua_State *L)
         _do(if (!strcasecmp(what, "count")) single_set_tx_count(pinfo, value);
             else if (!strcasecmp(what, "size")) single_set_pkt_size(pinfo, value);
             else if (!strcasecmp(what, "rate")) single_set_tx_rate(pinfo, luaL_checkstring(L, 3));
+            else if (!strcasecmp(what, "pps"))
+                single_set_tx_pps(pinfo, (uint64_t)luaL_checkinteger(L, 3));
+            else if (!strcasecmp(what, "bps"))
+                single_set_tx_bps(pinfo, (uint64_t)luaL_checkinteger(L, 3));
             else if (!strcasecmp(what, "burst")) single_set_tx_burst(pinfo, value);
             else if (!strcasecmp(what, "txburst")) single_set_tx_burst(pinfo, value);
             else if (!strcasecmp(what, "rxburst")) single_set_rx_burst(pinfo, value);

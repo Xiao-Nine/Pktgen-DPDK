@@ -27,6 +27,9 @@ extern "C" {
 #define PCAP_MAJOR_VERSION 2          /**< PCAP file format major version */
 #define PCAP_MINOR_VERSION 4          /**< PCAP file format minor version */
 
+/** Maximum number of replay queues (one mempool each) supported per PCAP file. */
+#define PCAP_MAX_QUEUES 32
+
 /** PCAP global file header. */
 typedef struct pcap_hdr_s {
     uint32_t magic_number;  /**< magic number */
@@ -48,12 +51,21 @@ typedef struct pcap_record_hdr_s {
 
 /** Pktgen PCAP replay state for one port. */
 typedef struct pcap_info_s {
-    char *filename;                  /**< allocated string for filename of pcap */
-    FILE *fp;                        /**< file pointer for pcap file */
-    struct rte_mempool *mp;          /**< Mempool for storing packets */
+    char *filename; /**< allocated string for filename of pcap */
+    FILE *fp;       /**< file pointer for pcap file */
+
+    /**
+     * One mempool per TX queue. The records of the file are distributed over
+     * the queues in a round-robin fashion, so every queue owns a fixed, ordered
+     * subset of the file and no two queues fight over the same mbufs.
+     */
+    struct rte_mempool *mp[PCAP_MAX_QUEUES];
+
+    uint32_t queue_cnt;              /**< Number of valid entries in mp[] */
     uint32_t convert;                /**< Endian flag value if 1 convert to host endian format */
     uint32_t max_pkt_size;           /**< largest packet found in pcap file */
     uint32_t avg_pkt_size;           /**< average packet size in pcap file */
+    uint64_t total_bytes;            /**< Sum of all captured record lengths */
     uint32_t pkt_count;              /**< Number of packets in pcap file */
     uint32_t pkt_index;              /**< Index of current packet in pcap file */
     pcap_hdr_t info;                 /**< information on the PCAP file */

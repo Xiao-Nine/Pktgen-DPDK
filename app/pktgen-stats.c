@@ -248,9 +248,11 @@ pktgen_get_link_status(port_info_t *pinfo)
         if (link.link_status == RTE_ETH_LINK_UP)
             pktgen_packet_rate(pinfo);
         else {
-            /* Link down: zero pacing so UI reflects inactive state */
-            pinfo->tx_cycles = 0;
-            pinfo->tx_pps    = 0;
+            /* Re-resolve the rate target: a percent-of-link target has nothing
+             * to pace against while the link is down, while an absolute rate
+             * target keeps working (useful on virtual ports). */
+            pktgen_rate_reset(pinfo);
+            pktgen_packet_rate(pinfo);
         }
     }
 }
@@ -271,7 +273,7 @@ pktgen_page_stats(void)
 {
     port_info_t *pinfo;
     unsigned int pid, col, row;
-    struct rte_eth_stats *rate, *cumm, *prev;
+    struct rte_eth_stats *rate, *cumm;
 
     unsigned sp;
     char buff[32];
@@ -333,7 +335,6 @@ pktgen_page_stats(void)
         scrn_printf(row, col, "%*s", COLUMN_WIDTH_1, buff);
 
         rate = &pinfo->stats.rate;
-        prev = &pinfo->stats.prev;
 
         /* Rx/Tx pkts/s rate */
         row = PKT_RATE_ROW;
@@ -363,8 +364,8 @@ pktgen_page_stats(void)
 
         /* Rx/Tx Errors */
         pktgen_display_set_color("stats.port.errors");
-        snprintf(buff, sizeof(buff), "%'" PRIu64 "/%'" PRIu64 "/%'" PRIu64, prev->ierrors,
-                 prev->oerrors, prev->imissed);
+        snprintf(buff, sizeof(buff), "%'" PRIu64 "/%'" PRIu64 "/%'" PRIu64, rate->ierrors,
+                 rate->oerrors, rate->imissed);
         scrn_printf(row++, col, "%*s", COLUMN_WIDTH_1, buff);
 
         /* Packets Sizes */
@@ -484,11 +485,27 @@ process_xstats(port_info_t *pinfo)
 }
 
 /**
+ * Scale the delta between two counters into a per second value.
+ */
+static inline uint64_t
+pktgen_rate_value(uint64_t curr, uint64_t prev, double scale)
+{
+    if (curr < prev) /* counter reset while sampling */
+        return 0;
+
+    return (uint64_t)((double)(curr - prev) * scale);
+}
+
+/**
  *
  * pktgen_process_stats - Process statistics for all ports on timer1
  *
  * DESCRIPTION
  * When timer1 callback happens then process all of the port statistics.
+ *
+ * The per second values are normalized by the time that really elapsed since
+ * the previous sample, so they stay correct even when this function is called
+ * late (or by a timer that is not exactly one second apart).
  *
  * RETURNS: N/A
  *
@@ -518,9 +535,14 @@ pktgen_process_stats(void)
 
     RTE_ETH_FOREACH_DEV(pid)
     {
+        uint64_t now, dt;
+        double scale;
+
         pinfo = l2p_get_port_pinfo(pid);
         if (pinfo == NULL)
             break;
+
+        now = pktgen_get_time();
 
         pktgen_get_link_status(pinfo);
 
@@ -542,15 +564,26 @@ pktgen_process_stats(void)
         curr->imissed   = curr->imissed - base->imissed;
         curr->rx_nombuf = curr->rx_nombuf - base->rx_nombuf;
 
-        /* Figure out the rate values */
-        rate->ipackets  = (curr->ipackets - prev->ipackets);
-        rate->opackets  = (curr->opackets - prev->opackets);
-        rate->ibytes    = (curr->ibytes - prev->ibytes);
-        rate->obytes    = (curr->obytes - prev->obytes);
-        rate->ierrors   = (curr->ierrors - prev->ierrors);
-        rate->oerrors   = (curr->oerrors - prev->oerrors);
-        rate->imissed   = (curr->imissed - prev->imissed);
-        rate->rx_nombuf = (curr->rx_nombuf - prev->rx_nombuf);
+        /* Normalize the deltas to a one second window based on the elapsed
+         * time, so the displayed rates are true packets/second and
+         * bits/second values. */
+        dt = now - pinfo->stats.last_tsc;
+        scale = (pinfo->stats.have_sample && dt > 0)
+                    ? ((double)pktgen_get_timer_hz() / (double)dt)
+                    : 0.0;
+
+        rate->ipackets  = pktgen_rate_value(curr->ipackets, prev->ipackets, scale);
+        rate->opackets  = pktgen_rate_value(curr->opackets, prev->opackets, scale);
+        rate->ibytes    = pktgen_rate_value(curr->ibytes, prev->ibytes, scale);
+        rate->obytes    = pktgen_rate_value(curr->obytes, prev->obytes, scale);
+        rate->ierrors   = pktgen_rate_value(curr->ierrors, prev->ierrors, scale);
+        rate->oerrors   = pktgen_rate_value(curr->oerrors, prev->oerrors, scale);
+        rate->imissed   = pktgen_rate_value(curr->imissed, prev->imissed, scale);
+        rate->rx_nombuf = pktgen_rate_value(curr->rx_nombuf, prev->rx_nombuf, scale);
+
+        pinfo->stats.elapsed     = dt;
+        pinfo->stats.last_tsc    = now;
+        pinfo->stats.have_sample = 1;
 
         /* Save the current values in previous */
         memcpy(prev, curr, sizeof(struct rte_eth_stats));
@@ -563,8 +596,26 @@ pktgen_process_stats(void)
          * reads from snap_qstats so it never races with the worker hot path. */
         rte_smp_rmb();
         int nq = RTE_MAX(l2p_get_rxcnt(pid), l2p_get_txcnt(pid));
-        for (int q = 0; q < nq && q < MAX_QUEUES_PER_PORT; q++)
-            pinfo->stats.snap_qstats[q] = pinfo->stats.qstats[q];
+        for (int q = 0; q < nq && q < MAX_QUEUES_PER_PORT; q++) {
+            qstats_t *snap = &pinfo->stats.snap_qstats[q];
+            qstats_t *pqs  = &pinfo->stats.prev_qstats[q];
+            qstats_t *rqs  = &pinfo->stats.qrate[q];
+
+            *snap = pinfo->stats.qstats[q];
+
+            /* Normalize the per queue deltas the same way as the port rate, so
+             * the queue page shows true packets/second values. */
+            rqs->q_ipackets  = pktgen_rate_value(snap->q_ipackets, pqs->q_ipackets, scale);
+            rqs->q_opackets  = pktgen_rate_value(snap->q_opackets, pqs->q_opackets, scale);
+            rqs->q_obytes    = pktgen_rate_value(snap->q_obytes, pqs->q_obytes, scale);
+            rqs->q_errors    = pktgen_rate_value(snap->q_errors, pqs->q_errors, scale);
+            rqs->q_ring_full = snap->q_ring_full - pqs->q_ring_full;
+            rqs->q_mbuf_fail = snap->q_mbuf_fail - pqs->q_mbuf_fail;
+
+            *pqs = *snap;
+        }
+        for (int q = nq; q < MAX_QUEUES_PER_PORT; q++)
+            memset(&pinfo->stats.qrate[q], 0, sizeof(qstats_t));
     }
 }
 
@@ -575,7 +626,7 @@ pktgen_page_qstats(uint16_t pid)
     struct rte_eth_stats *s, *r;
     struct rte_ether_addr ethaddr;
     char buff[128], mac_buf[32], dev_name[64];
-    uint64_t ipackets, opackets, errs;
+    uint64_t ipackets, opackets, errs, deferred, nombuf;
     port_info_t *pinfo;
 
     pinfo = l2p_get_port_pinfo(pid);
@@ -625,34 +676,38 @@ pktgen_page_qstats(uint16_t pid)
     scrn_printf(row + 5, col, "%*s", width, buff);
 
     row += 6;
-    ipackets = opackets = errs = 0;
-    hdr                        = 0;
-    int nq                     = RTE_MAX(l2p_get_rxcnt(pid), l2p_get_txcnt(pid));
+    ipackets = opackets = errs = deferred = nombuf = 0;
+    hdr       = 0;
+    int nq    = RTE_MAX(l2p_get_rxcnt(pid), l2p_get_txcnt(pid));
     for (q = 0; q < (unsigned int)nq; q++) {
-        uint64_t rxpkts, txpkts, errors;
-        qstats_t *qs      = &pinfo->stats.snap_qstats[q];
-        qstats_t *prev_qs = &pinfo->stats.prev_qstats[q];
+        uint64_t rxpkts, txpkts, errors, ring_full, mbuf_fail;
+        qstats_t *rq = &pinfo->stats.qrate[q];
 
         if (!hdr) {
             hdr = 1;
             row++;
             pktgen_display_set_color("stats.port.status");
-            scrn_printf(row++, 1, "%-8s: %14s %14s %14s", "Rate/sec", "ipackets", "opackets",
-                        "errors");
+            scrn_printf(row++, 1, "%-8s: %14s %14s %14s %14s %14s", "Rate/sec", "ipackets",
+                        "opackets", "errors", "ring-full", "no-mbuf");
             pktgen_display_set_color("stats.stat.values");
         }
 
-        rxpkts   = qs->q_ipackets - prev_qs->q_ipackets;
-        txpkts   = qs->q_opackets - prev_qs->q_opackets;
-        errors   = qs->q_errors - prev_qs->q_errors;
-        *prev_qs = *qs;
+        rxpkts    = rq->q_ipackets;
+        txpkts    = rq->q_opackets;
+        errors    = rq->q_errors;
+        ring_full = rq->q_ring_full;
+        mbuf_fail = rq->q_mbuf_fail;
 
-        scrn_printf(row++, 1, "  Q %2d  : %'14lu %'14lu %'14lu", q, rxpkts, txpkts, errors);
+        scrn_printf(row++, 1, "  Q %2u  : %'14lu %'14lu %'14lu %'14lu %'14lu", q, rxpkts,
+                    txpkts, errors, ring_full, mbuf_fail);
         ipackets += rxpkts;
         opackets += txpkts;
         errs += errors;
+        deferred += ring_full;
+        nombuf += mbuf_fail;
     }
-    scrn_printf(row++, 1, " %-7s: %'14lu %'14lu %'14lu", "Totals", ipackets, opackets, errs);
+    scrn_printf(row++, 1, " %-7s: %'14lu %'14lu %'14lu %'14lu %'14lu", "Totals", ipackets,
+                opackets, errs, deferred, nombuf);
     pktgen_display_set_color(NULL);
     display_dashline(row + 2);
     scrn_eol();

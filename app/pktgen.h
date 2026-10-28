@@ -196,7 +196,7 @@ enum {
     COLUMN_WIDTH_1 = 24, /**< Width of display column 1 */
     COLUMN_WIDTH_3 = 24, /**< Width of display column 3 */
 
-    DEFAULT_MAX_TX_LAG = 20000, /**< Max TX lag cycles; ideally make configurable */
+    DEFAULT_MAX_TX_LAG = 20000, /**< Unused, kept for source compatibility */
 
     /* Row locations for start of data */
     PAGE_TITLE_ROWS = 1,  /**< Number of rows for the page title */
@@ -269,6 +269,9 @@ enum {
 
 /** Compute the wire size of a packet including all physical overhead. */
 #define WIRE_SIZE(pkt_size, t) (t)(pkt_size + PKT_OVERHEAD_SIZE)
+
+/** Compute the wire size in bits of a packet, including all physical overhead. */
+#define WIRE_BITS(pkt_size) (WIRE_SIZE(pkt_size, uint64_t) * 8)
 
 /** Convenience typedef for struct rte_mbuf. */
 typedef struct rte_mbuf rte_mbuf_t;
@@ -389,6 +392,13 @@ void pktgen_packet_ctor(port_info_t *pinfo, int32_t seq_idx, int32_t type);
  * @param pinfo  Per-port state.
  */
 void pktgen_packet_rate(port_info_t *pinfo);
+
+/**
+ * Discard the accumulated rate limiter budget of a port.
+ *
+ * @param pinfo  Per-port state.
+ */
+void pktgen_rate_reset(port_info_t *pinfo);
 
 /**
  * Test whether an IPv4 address matches the port's source IP.
